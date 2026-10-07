@@ -16,6 +16,14 @@ omarchy plugin add https://github.com/Nejcc/omarchy-safe-update.git
 
 Enable it, click the shield in the bar and press **Install hooks**. That copies two small hook files into `~/.config/omarchy/hooks/post-update.d/` and `post-boot.d/`. **Remove hooks** deletes them again. Nothing runs after updates until you install them.
 
+## Uninstall
+
+```sh
+omarchy plugin remove nejcc.safe-update
+```
+
+If you installed the hooks, click **Remove hooks** in the panel first (or run `bash ~/.config/omarchy/plugins/nejcc.safe-update/bin/safe-update hooks remove`). Leftover hooks exit quietly once the plugin is gone. State lives in `~/.local/state/omarchy-safe-update/`.
+
 ## Usage
 
 The panel shows:
