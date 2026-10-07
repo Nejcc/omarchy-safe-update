@@ -1,0 +1,18 @@
+{
+  "schemaVersion": 1,
+  "id": "nejcc.safe-update",
+  "name": "Safe Update",
+  "version": "0.1.0",
+  "author": "Nejcc",
+  "license": "MIT",
+  "description": "Checks the shell and every plugin after an Omarchy update and shows the snapshot to roll back to",
+  "kinds": ["bar-widget"],
+  "entryPoints": { "barWidget": "BarWidget.qml" },
+  "barWidget": {
+    "displayName": "Safe Update",
+    "description": "Post-update plugin check and rollback snapshot",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

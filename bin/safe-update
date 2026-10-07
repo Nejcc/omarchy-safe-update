@@ -1,0 +1,252 @@
+#!/bin/bash
+
+# Post-update smoke test for Omarchy plugins. Omarchy already takes the Snapper
+# snapshot before every update (omarchy-snapshot create); this only records
+# which one, checks the shell and every third-party plugin after the update,
+# and writes the result for the bar widget.
+#
+#   safe-update check [--no-notify]   run the checks now
+#   safe-update post-update            hook entry: record the update, check once it ends
+#   safe-update post-boot              hook entry: finish a check a reboot interrupted
+#   safe-update hooks install|remove   copy or remove the hook files
+#
+# Read-only apart from its own state dir and, on request, the hook files.
+
+set -uo pipefail
+
+self=$(readlink -f "$0")
+plugin_dir=$(dirname "$(dirname "$self")")
+
+state_dir=${SAFE_UPDATE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/omarchy-safe-update}
+plugins_dir=${SAFE_UPDATE_PLUGINS_DIR:-$HOME/.config/omarchy/plugins}
+# omarchy-hook reads $HOME/.config, not $XDG_CONFIG_HOME.
+hooks_dir=${SAFE_UPDATE_HOOKS_DIR:-$HOME/.config/omarchy/hooks}
+update_log=${SAFE_UPDATE_UPDATE_LOG:-/tmp/omarchy-update.log}
+pacman_log=${SAFE_UPDATE_PACMAN_LOG:-/var/log/pacman.log}
+lock_path=${XDG_RUNTIME_DIR:-/tmp}/omarchy-update.lock
+settle=${SAFE_UPDATE_SETTLE:-15}
+
+hook_points=(post-update post-boot)
+hook_name=nejcc-safe-update
+
+# QML errors worth reporting. Duplicate IpcHandler warnings are plugin
+# hot-reload noise and a missing state file is a plugin's first run.
+error_re='Error|error:|unavailable|is not a type|is not installed|is not defined|Cannot |Unable to|failed to load|Non-existent|Invalid|PluginRegistry'
+noise_re='another handler is registered|File does not exist'
+
+now() { date +%s; }
+
+shell_ok() { OMARCHY_SHELL_IPC_TIMEOUT=2s omarchy-shell shell ping >/dev/null 2>&1; }
+
+wait_for_shell() {
+  local i
+  for ((i = 0; i < 60; i++)); do
+    shell_ok && return 0
+    sleep 1
+  done
+  return 1
+}
+
+omarchy_version() { omarchy-version 2>/dev/null || echo unknown; }
+
+# Omarchy labels its pre-update snapshot with omarchy-version from before the
+# upgrade, so that is the version from the last pacman run, if omarchy moved.
+version_before() {
+  local before
+  before=$(awk '
+    /\[PACMAN\] starting full system upgrade/ { v = "" }
+    /\[ALPM\] upgraded omarchy \(/ { s = $0; sub(/.*upgraded omarchy \(/, "", s); sub(/ ->.*/, "", s); v = s }
+    END { print v }' "$pacman_log" 2>/dev/null)
+  echo "${before:-$(omarchy_version)}"
+}
+
+# What omarchy-update printed about its snapshot during this run.
+snapshot_state() {
+  if [[ -f $update_log ]] && grep -q 'Snapshots can be selected during boot' "$update_log"; then
+    echo taken
+  elif [[ -f $update_log ]] && grep -q 'Continuing the update without a snapshot' "$update_log"; then
+    echo failed
+  elif ! command -v snapper >/dev/null 2>&1; then
+    echo unavailable
+  else
+    echo unknown
+  fi
+}
+
+# Snapper only answers users listed in ALLOW_USERS. Elsewhere the number stays
+# unknown and the panel points at the boot menu instead.
+snapshot_number() {
+  snapper --jsonout -c root list 2>/dev/null |
+    jq -r --arg d "$1" '[.root[]? | select(.description == $d) | .number] | last // empty' 2>/dev/null
+}
+
+write_json() {
+  mkdir -p "$state_dir"
+  local tmp
+  tmp=$(mktemp "$state_dir/.tmp.XXXXXX") || return 1
+  cat >"$tmp" && mv -f "$tmp" "$1"
+}
+
+record_update() {
+  local before snap
+  before=$(version_before)
+  snap=$(snapshot_state)
+  jq -n --argjson since "$(now)" --arg before "$before" --arg snap "$snap" \
+    --arg number "$(snapshot_number "$before")" \
+    '{since: $since, versionBefore: $before,
+      snapshot: {state: $snap, label: $before, number: ($number | tonumber? // null)}}' |
+    write_json "$state_dir/pending.json"
+}
+
+# One {dir, id, name, valid, validateError} line per installed plugin.
+validate_plugins() {
+  local dir id name out rc
+  for dir in "$plugins_dir"/*/; do
+    dir=${dir%/}
+    [[ -f $dir/manifest.json ]] || continue
+    id=$(jq -r '.id // empty' "$dir/manifest.json" 2>/dev/null)
+    name=$(jq -r '.name // empty' "$dir/manifest.json" 2>/dev/null)
+    out=$(omarchy plugin validate "$dir" 2>&1)
+    rc=$?
+    jq -cn --arg dir "${dir##*/}" --arg id "${id:-${dir##*/}}" --arg name "${name:-${id:-${dir##*/}}}" \
+      --argjson valid "$([[ $rc == 0 ]] && echo true || echo false)" --arg err "$([[ $rc == 0 ]] || echo "$out")" \
+      '{dir: $dir, id: $id, name: $name, valid: $valid, validateError: $err}'
+  done
+}
+
+# Shell log lines since the update that can matter, colour codes stripped.
+shell_journal() {
+  journalctl --user -t omarchy-shell --since "@$1" -o cat --no-pager 2>/dev/null |
+    grep -E '/plugins/|Omarchy shell exited with status' | sed 's/\x1b\[[0-9;]*m//g'
+}
+
+# Turns raw inputs into the report. tests/check.test.sh covers it through
+# stubbed commands.
+#   stdin journal text  $1 plugin lines (validate_plugins)  $2 listPlugins JSON or ""
+#   $3 shell ok true|false  $4 meta JSON (since, versions, snapshot, checkedAt)
+build_report() {
+  jq -n --rawfile journal /dev/stdin --arg plugins "$1" --arg listed "$2" --argjson shellOk "$3" --argjson meta "$4" \
+    --arg errorRe "$error_re" --arg noiseRe "$noise_re" '
+    ($listed | fromjson? // []) as $listed
+    | ($journal | split("\n")) as $lines
+    | [$plugins | split("\n")[] | select(length > 0) | fromjson] as $plugins
+    | ($lines | map(select(test("Omarchy shell exited with status"))) | length) as $restarts
+    | [ $plugins[] as $p
+        | ($listed | map(select(.id == $p.id)) | first) as $l
+        | ($lines | map(select(contains("/plugins/" + $p.dir + "/") and test($errorRe) and (test($noiseRe) | not)))
+            | map(sub("^\\s*(WARN|ERROR|INFO|DEBUG)\\s+[a-z.]+:\\s*"; "")) | unique | .[:5]) as $errors
+        | $p + {enabled: (if $l == null then null else $l.enabled end), errors: $errors,
+                ok: ($p.valid and ($errors | length) == 0)} ]
+    | sort_by(.ok, .name) as $report
+    | ($report | map(select(.ok | not)) | length) as $broken
+    | $meta + {
+        version: 1,
+        status: (if ($shellOk | not) or $broken > 0 or $restarts > 0 then "broken" else "ok" end),
+        shell: {ok: $shellOk, restarts: $restarts},
+        broken: $broken,
+        plugins: $report
+      }'
+}
+
+summary() {
+  jq -r '
+    [ (if .shell.ok then empty else "the shell does not answer" end),
+      (if .shell.restarts > 0 then "the shell restarted \(.shell.restarts)x" else empty end),
+      (.plugins[] | select(.ok | not) | .name) ] | join(", ")' "$1"
+}
+
+check() {
+  local notify=1 pending meta since listed ok
+  [[ ${1:-} == --no-notify ]] && notify=0
+  pending="$state_dir/pending.json"
+
+  if [[ -f $pending ]]; then
+    meta=$(jq -c . "$pending" 2>/dev/null) || meta='{}'
+  else
+    # A manual check outside an update: everything since this boot.
+    since=$(($(now) - $(cut -d. -f1 /proc/uptime)))
+    meta=$(jq -cn --argjson since "$since" '{since: $since, manual: true}')
+  fi
+  since=$(jq -r '.since // 0' <<<"$meta")
+
+  ok=false
+  listed=""
+  if shell_ok; then
+    ok=true
+    listed=$(omarchy-shell shell listPlugins 2>/dev/null)
+  fi
+
+  meta=$(jq -c --argjson at "$(now)" --arg after "$(omarchy_version)" \
+    '. + {checkedAt: $at, versionAfter: $after}' <<<"$meta")
+
+  shell_journal "$since" | build_report "$(validate_plugins)" "$listed" "$ok" "$meta" |
+    write_json "$state_dir/last.json" || return 1
+  rm -f "$pending"
+
+  if ((notify)) && [[ $(jq -r .status "$state_dir/last.json") == broken ]]; then
+    omarchy-notification-send -u critical -g $'' "Update broke something" \
+      "$(summary "$state_dir/last.json")" --exec omarchy-shell nejcc.safe-update open >/dev/null 2>&1 &
+  fi
+  return 0
+}
+
+# Runs detached: the update restarts the shell only at its very end, so wait
+# for the update lock to free up (instant at boot), then for the fresh shell.
+wait_check() {
+  flock -w 21600 "$lock_path" true 2>/dev/null
+  wait_for_shell
+  sleep "$settle"
+  check
+}
+
+post_update() {
+  record_update
+  # The update holds its lock on an inherited fd. A waiter that kept it would
+  # block the next update, so it gets closed before forking.
+  if [[ ${OMARCHY_UPDATE_LOCK_FD:-} =~ ^[0-9]+$ ]]; then
+    eval "exec ${OMARCHY_UPDATE_LOCK_FD}>&-"
+  fi
+  # Detached from the update's terminal so `script` does not wait on it.
+  setsid -f "$self" wait-check </dev/null >/dev/null 2>&1
+}
+
+post_boot() {
+  # A reboot at the end of the update kills the waiter; finish its check
+  # without holding up the other post-boot hooks.
+  [[ -f $state_dir/pending.json ]] || return 0
+  setsid -f "$self" wait-check </dev/null >/dev/null 2>&1
+}
+
+hooks() {
+  local point
+  case ${1:-} in
+  install)
+    for point in "${hook_points[@]}"; do
+      mkdir -p "$hooks_dir/$point.d"
+      sed "s|@PLUGIN_DIR@|$plugin_dir|" "$plugin_dir/hooks/$point" >"$hooks_dir/$point.d/$hook_name"
+      chmod +x "$hooks_dir/$point.d/$hook_name"
+    done
+    ;;
+  remove)
+    for point in "${hook_points[@]}"; do
+      rm -f "$hooks_dir/$point.d/$hook_name"
+    done
+    ;;
+  *)
+    echo "Usage: safe-update hooks install|remove" >&2
+    return 2
+    ;;
+  esac
+}
+
+case ${1:-} in
+check) check "${2:-}" ;;
+post-update) post_update ;;
+post-boot) post_boot ;;
+wait-check) wait_check ;;
+hooks) hooks "${2:-}" ;;
+*)
+  echo "Usage: safe-update check [--no-notify] | post-update | post-boot | hooks install|remove" >&2
+  exit 2
+  ;;
+esac

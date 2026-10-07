@@ -1,0 +1,8 @@
+#!/bin/bash
+
+# Installed by the Safe Update plugin (nejcc.safe-update). Remove it from the
+# plugin's panel, or delete this file.
+
+check="@PLUGIN_DIR@/bin/safe-update"
+[[ -x $check ]] || exit 0
+exec "$check" post-boot
