@@ -2,6 +2,8 @@
 
 A bar widget that tells you whether the last `omarchy update` broke the shell or any of your plugins, and which snapshot to roll back to if it did.
 
+![Preview](preview.png)
+
 ## The problem
 
 Omarchy and Arch updates break third-party plugins now and then. You find out when a widget is missing or the bar is gone, and then you roll back blind: which snapshot was the one before the update?
